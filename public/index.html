@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Space Fight Online</title>
+    <style>
+        body { background-color: #111; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; color: white; font-family: 'Courier New', Courier, monospace; overflow: hidden; }
+        canvas { background-color: #050505; border: 3px solid #444; box-shadow: 0 0 30px rgba(0, 0, 0, 0.8); max-width: 95vw; max-height: 90vh; }
+        #status { margin-top: 10px; background: #333; padding: 10px; border-radius: 5px; text-align: center; }
+        .key { background: #555; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="1350" height="750"></canvas>
+    <div id="status">Connecting to server...</div>
+
+    <!-- Load Socket.io Client -->
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+
+        // --- Game Config ---
+        const PLAYER_SIZE = 40;
+        const VELOCITY = 5;
+        const BULLET_VELOCITY = 8;
+        
+        let myPlayerNum = 0;
+        let myId = null;
+        let gameActive = false; // Wait for connection
+        
+        // Local state of players (synced from server)
+        let players = {};
+        let bullets = [];
+        let stars = [], planets = [];
+        let countdown = 0;
+        let winnerText = "";
+
+        // --- Audio (Optional) ---
+        const sounds = { shoot: new Audio('grenade.mp3'), hit: new Audio('hit.mp3'), music: new Audio('starwars.mp3') };
+        sounds.music.loop = true;
+        function playSound(name) { try { sounds[name].cloneNode().play().catch(()=>{}); } catch(e){} }
+
+        // --- Background ---
+        function initBackground() {
+            for(let i=0; i<150; i++) stars.push({x: Math.random()*canvas.width, y: Math.random()*canvas.height, s: Math.random()*2, a: Math.random()});
+            for(let i=0; i<4; i++) planets.push({x: Math.random()*(canvas.width-100)+50, y: Math.random()*(canvas.height-100)+50, r: Math.random()*30+10, c: `hsl(${Math.random()*360},60%,40%)`});
+        }
+        initBackground();
+
+        // --- Inputs ---
+        const keys = {};
+        window.addEventListener('keydown', e => {
+            keys[e.code] = true;
+            if(["ArrowUp","ArrowDown","ArrowLeft","ArrowRight", "Space"].indexOf(e.code) > -1) e.preventDefault();
+            
+            if(gameActive && myPlayerNum > 0) {
+                // Determine Shoot Key based on Player Number
+                let shootKey = (myPlayerNum === 1) ? 'CapsLock' : 'Enter';
+                
+                if (e.code === shootKey) {
+                    socket.emit('shoot');
+                }
+            }
+        });
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        // --- Socket Events ---
+        socket.on('init', (data) => {
+            myPlayerNum = data.playerNumber;
+            myId = data.id;
+            players = data.players;
+            gameActive = true;
+            
+            let controls = (myPlayerNum === 1) 
+                ? "You are RED. Move: W A S D | Shoot: CapsLock" 
+                : "You are YELLOW. Move: Arrows | Shoot: Enter";
+            statusDiv.innerHTML = controls;
+            
+            // Start Music on click (browser policy)
+            document.addEventListener('click', () => { sounds.music.play().catch(()=>{}); }, {once:true});
+        });
+
+        socket.on('playerJoined', (player) => { players[socket.id] = player; }); // Receive update about other player
+        socket.on('playerDisconnected', (id) => { delete players[id]; });
+        
+        socket.on('playerMoved', (data) => {
+            if(players[data.id]) {
+                players[data.id].x = data.x;
+                players[data.id].y = data.y;
+            }
+        });
+
+        socket.on('playerShot', (data) => {
+            playSound('shoot');
+            // Spawn bullet visually
+            let p = players[data.id];
+            if(!p) return;
+            
+            let b = { 
+                x: (p.playerNumber === 1) ? p.x + PLAYER_SIZE : p.x, 
+                y: p.y + PLAYER_SIZE/2 - 3, 
+                w: 12, h: 6, 
+                dir: (p.playerNumber === 1) ? 1 : -1,
+                ownerId: data.id 
+            };
+            bullets.push(b);
+        });
+
+        socket.on('updateHealth', (data) => {
+            if(players[data.id]) {
+                players[data.id].health = data.health;
+                playSound('hit');
+            }
+        });
+
+        socket.on('gameOver', (data) => {
+            gameActive = false;
+            winnerText = (data.winner === 1) ? "Red Wins!" : "Yellow Wins!";
+            countdown = 10;
+            let timer = setInterval(() => {
+                countdown--;
+                if(countdown <= 0) clearInterval(timer);
+            }, 1000);
+        });
+
+        socket.on('resetGame', (serverPlayers) => {
+            players = serverPlayers;
+            bullets = [];
+            gameActive = true;
+            winnerText = "";
+        });
+
+        socket.on('serverFull', () => { statusDiv.innerHTML = "Server Full. Please wait."; });
+
+        // --- Game Logic ---
+        function update() {
+            if (gameActive && players[myId]) {
+                let me = players[myId];
+                let moved = false;
+                
+                // Movement Logic (Client Prediction)
+                const borderX = (canvas.width / 2) - 5;
+                
+                if (myPlayerNum === 1) { // WASD
+                    if (keys['KeyA'] && me.x > 0) { me.x -= VELOCITY; moved = true; }
+                    if (keys['KeyD'] && me.x + PLAYER_SIZE < borderX) { me.x += VELOCITY; moved = true; }
+                    if (keys['KeyW'] && me.y > 0) { me.y -= VELOCITY; moved = true; }
+                    if (keys['KeyS'] && me.y + PLAYER_SIZE < canvas.height) { me.y += VELOCITY; moved = true; }
+                } else if (myPlayerNum === 2) { // Arrows
+                    if (keys['ArrowLeft'] && me.x > borderX + 10) { me.x -= VELOCITY; moved = true; }
+                    if (keys['ArrowRight'] && me.x + PLAYER_SIZE < canvas.width) { me.x += VELOCITY; moved = true; }
+                    if (keys['ArrowUp'] && me.y > 0) { me.y -= VELOCITY; moved = true; }
+                    if (keys['ArrowDown'] && me.y + PLAYER_SIZE < canvas.height) { me.y += VELOCITY; moved = true; }
+                }
+
+                if (moved) socket.emit('move', { x: me.x, y: me.y });
+            }
+
+            // Bullet Logic
+            for (let i = 0; i < bullets.length; i++) {
+                let b = bullets[i];
+                b.x += (BULLET_VELOCITY * b.dir);
+
+                // Collision Check (I only check if *I* got hit)
+                if (players[myId] && b.ownerId !== myId) {
+                    let me = players[myId];
+                    if (rectIntersect(b.x, b.y, b.w, b.h, me.x, me.y, PLAYER_SIZE, PLAYER_SIZE)) {
+                        socket.emit('hit'); // Tell server I took damage
+                        bullets.splice(i, 1);
+                        i--;
+                        continue;
+                    }
+                }
+
+                // Cleanup bounds
+                if (b.x < 0 || b.x > canvas.width) { bullets.splice(i, 1); i--; }
+            }
+        }
+
+        function rectIntersect(x1, y1, w1, h1, x2, y2, w2, h2) {
+            return x2 < x1 + w1 && x2 + w2 > x1 && y2 < y1 + h1 && y2 + h2 > y1;
+        }
+
+        // --- Drawing ---
+        function draw() {
+            // Clear
+            ctx.fillStyle = '#050505'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Background
+            planets.forEach(p => { ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill(); });
+            ctx.fillStyle = "white"; stars.forEach(s => { ctx.globalAlpha = s.a; ctx.beginPath(); ctx.arc(s.x, s.y, s.s, 0, Math.PI*2); ctx.fill(); });
+            ctx.globalAlpha = 1;
+
+            // Wall
+            ctx.fillStyle = 'white'; ctx.fillRect((canvas.width/2)-5, 0, 10, canvas.height);
+
+            // Players
+            Object.values(players).forEach(p => {
+                let color = (p.playerNumber === 1) ? '#ff3333' : '#ffcc00';
+                let secondary = (p.playerNumber === 1) ? '#990000' : '#997a00';
+                let dir = (p.playerNumber === 1) ? 'right' : 'left';
+                drawSpaceship(p.x, p.y, color, secondary, dir);
+            });
+
+            // Bullets
+            bullets.forEach(b => {
+                ctx.fillStyle = (b.dir === 1) ? '#ffaaaa' : '#ffffaa';
+                ctx.fillRect(b.x, b.y, b.w, b.h);
+            });
+
+            // UI
+            if(gameActive) {
+                // Find Red and Yellow health
+                let redP = Object.values(players).find(p => p.playerNumber === 1);
+                let yelP = Object.values(players).find(p => p.playerNumber === 2);
+                
+                ctx.fillStyle = 'white'; ctx.font = '24px Arial';
+                if(redP) ctx.fillText("Red Health: " + redP.health, 10, 30);
+                if(yelP) ctx.fillText("Yellow Health: " + yelP.health, canvas.width - 200, 30);
+            } else if (winnerText !== "") {
+                ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0,0, canvas.width, canvas.height);
+                ctx.fillStyle = 'white'; ctx.textAlign = 'center';
+                ctx.font = 'bold 70px Arial'; ctx.fillText(winnerText, canvas.width/2, canvas.height/2 - 20);
+                ctx.font = '30px Arial'; ctx.fillText("Next game: " + countdown, canvas.width/2, canvas.height/2 + 50);
+                ctx.textAlign = 'start';
+            }
+        }
+
+        function drawSpaceship(x, y, color, secondary, direction) {
+            ctx.save(); ctx.translate(x, y);
+            if (direction === 'left') { ctx.translate(PLAYER_SIZE, 0); ctx.scale(-1, 1); }
+            ctx.beginPath(); ctx.moveTo(40, 20); ctx.lineTo(0, 0); ctx.lineTo(5, 20); ctx.lineTo(0, 40); ctx.fillStyle = color; ctx.fill();
+            ctx.beginPath(); ctx.ellipse(25, 20, 5, 8, Math.PI/2, 0, Math.PI*2); ctx.fillStyle = '#add8e6'; ctx.fill();
+            ctx.fillStyle = secondary; ctx.beginPath(); ctx.moveTo(15, 10); ctx.lineTo(0, 0); ctx.lineTo(5, 10); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(15, 30); ctx.lineTo(0, 40); ctx.lineTo(5, 30); ctx.fill();
+            ctx.restore();
+        }
+
+        function loop() {
+            update();
+            draw();
+            requestAnimationFrame(loop);
+        }
+        loop();
+    </script>
+</body>
+</html>
